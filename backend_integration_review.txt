@@ -1,0 +1,4200 @@
+
+========================================
+FILE: internal/waitlist/model.go
+========================================
+package waitlist
+
+import (
+	"errors"
+	"net/mail"
+	"strings"
+	"time"
+)
+
+var (
+	ErrInvalidEmail         = errors.New("invalid email address")
+	ErrRegistrationNotFound = errors.New("registration not found")
+	ErrConfigNotFound       = errors.New("waitlist configuration not found")
+	ErrInvalidConfig        = errors.New("invalid waitlist configuration")
+)
+
+type Registration struct {
+	RegistrationID string `json:"registration_id"`
+	Email          string `json:"-"`
+	Position       int64  `json:"position"`
+
+	LaunchUpdatesConsent bool `json:"-"`
+	MarketingConsent     bool `json:"-"`
+
+	ConsentRecordedAt time.Time `json:"-"`
+
+	LaunchUpdatesUnsubscribedAt *time.Time `json:"-"`
+	MarketingUnsubscribedAt     *time.Time `json:"-"`
+
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type RegistrationInput struct {
+	Email string
+
+	LaunchUpdatesConsent bool
+	MarketingConsent     bool
+}
+
+type RegistrationResult struct {
+	Registration    Registration
+	IsExisting      bool
+	TotalRegistered int64
+}
+
+type WaitlistConfig struct {
+	ConfigID  string    `json:"config_id"`
+	LaunchAt  time.Time `json:"launch_at"`
+	Timezone  string    `json:"timezone"`
+	UpdatedAt time.Time `json:"updated_at"`
+	UpdatedBy *string   `json:"-"`
+}
+
+type WaitlistConfigInput struct {
+	LaunchAt  time.Time
+	Timezone  string
+	UpdatedBy *string
+}
+
+// NormalizeEmail ensures email addresses are stored
+// in a consistent lowercase, trimmed format.
+func NormalizeEmail(email string) (string, error) {
+	normalised := strings.ToLower(strings.TrimSpace(email))
+
+	if normalised == "" || len(normalised) > 254 {
+		return "", ErrInvalidEmail
+	}
+
+	parsed, err := mail.ParseAddress(normalised)
+	if err != nil {
+		return "", ErrInvalidEmail
+	}
+
+	// Reject display-name formats such as:
+	// Edmond <edmond@example.com>
+	if parsed.Address != normalised {
+		return "", ErrInvalidEmail
+	}
+
+	return normalised, nil
+}
+
+========================================
+FILE: internal/waitlist/handler.go
+========================================
+package waitlist
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"mime"
+	"net/http"
+	"strings"
+	"time"
+)
+
+type Handler struct {
+	service *Service
+	tokens  *UnsubscribeTokenManager
+}
+
+func NewHandler(
+	service *Service,
+	tokens *UnsubscribeTokenManager,
+) *Handler {
+	return &Handler{
+		service: service,
+		tokens:  tokens,
+	}
+}
+
+// =====================================================
+// REQUEST / RESPONSE STRUCTURES
+// =====================================================
+
+// Public registration request.
+type registerRequest struct {
+	Email                string `json:"email"`
+	LaunchUpdatesConsent bool   `json:"launch_updates_consent"`
+	MarketingConsent     bool   `json:"marketing_consent"`
+}
+
+// Public registration response.
+// Never expose email addresses or consent records.
+type registerResponse struct {
+	Message           string `json:"message"`
+	Position          int64  `json:"position"`
+	TotalRegistered   int64  `json:"total_registered"`
+	AlreadyRegistered bool   `json:"already_registered"`
+}
+
+// Public waitlist count.
+type countResponse struct {
+	TotalRegistered int64 `json:"total_registered"`
+}
+
+// Public launch configuration.
+type configResponse struct {
+	LaunchAt time.Time    `json:"launch_at"`
+	Timezone string       `json:"timezone"`
+	Status   LaunchStatus `json:"status"`
+}
+
+// Administrator launch configuration request.
+type updateConfigRequest struct {
+	LaunchAt time.Time `json:"launch_at"`
+	Timezone string    `json:"timezone"`
+}
+
+// Secure unsubscribe request.
+// Tokens are submitted in the POST body, never the URL.
+type unsubscribeRequest struct {
+	Token string `json:"token"`
+}
+
+// Generic API error.
+type errorResponse struct {
+	Error string `json:"error"`
+}
+
+// Unsubscribe response.
+type unsubscribeResponse struct {
+	Message string `json:"message"`
+}
+
+// =====================================================
+// JSON RESPONSE HELPERS
+// =====================================================
+
+func writeJSON(
+	w http.ResponseWriter,
+	status int,
+	payload any,
+) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeError(
+	w http.ResponseWriter,
+	status int,
+	message string,
+) {
+	writeJSON(
+		w,
+		status,
+		errorResponse{
+			Error: message,
+		},
+	)
+}
+
+// =====================================================
+// JSON REQUEST VALIDATION
+// =====================================================
+
+// decodeJSON enforces:
+// - application/json content type
+// - maximum request body size of 16 KB
+// - rejection of unknown JSON fields
+// - exactly one JSON object per request
+func decodeJSON(
+	w http.ResponseWriter,
+	r *http.Request,
+	destination any,
+) error {
+
+	contentType := r.Header.Get("Content-Type")
+
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil || mediaType != "application/json" {
+		return errors.New("content type must be application/json")
+	}
+
+	r.Body = http.MaxBytesReader(
+		w,
+		r.Body,
+		16*1024,
+	)
+
+	decoder := json.NewDecoder(r.Body)
+
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+
+	// Reject additional JSON values or trailing content.
+	var extra any
+
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("request must contain exactly one JSON object")
+		}
+
+		return err
+	}
+
+	return nil
+}
+
+// handleJSONDecodeError provides consistent HTTP responses.
+func handleJSONDecodeError(
+	w http.ResponseWriter,
+	err error,
+) {
+	var maxBytesError *http.MaxBytesError
+
+	if errors.As(err, &maxBytesError) {
+		writeError(
+			w,
+			http.StatusRequestEntityTooLarge,
+			"Request body is too large.",
+		)
+		return
+	}
+
+	writeError(
+		w,
+		http.StatusBadRequest,
+		"Invalid request body.",
+	)
+}
+
+// =====================================================
+// PUBLIC REGISTRATION
+// POST /v1/waitlist/register
+// =====================================================
+
+func (h *Handler) Register(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	var request registerRequest
+
+	if err := decodeJSON(w, r, &request); err != nil {
+		handleJSONDecodeError(w, err)
+		return
+	}
+
+	result, err := h.service.Register(
+		r.Context(),
+		RegistrationInput{
+			Email:                request.Email,
+			LaunchUpdatesConsent: request.LaunchUpdatesConsent,
+			MarketingConsent:     request.MarketingConsent,
+		},
+	)
+
+	if err != nil {
+		if errors.Is(err, ErrInvalidEmail) {
+			writeError(
+				w,
+				http.StatusUnprocessableEntity,
+				"Please provide a valid email address.",
+			)
+			return
+		}
+
+		// Do not expose database errors or internal details.
+		writeError(
+			w,
+			http.StatusInternalServerError,
+			"Registration could not be completed.",
+		)
+		return
+	}
+
+	status := http.StatusCreated
+
+	message := "Your waitlist registration was successful."
+
+	if result.IsExisting {
+		status = http.StatusOK
+		message = "This email is already registered."
+	}
+
+	writeJSON(
+		w,
+		status,
+		registerResponse{
+			Message:           message,
+			Position:          result.Registration.Position,
+			TotalRegistered:   result.TotalRegistered,
+			AlreadyRegistered: result.IsExisting,
+		},
+	)
+}
+
+// =====================================================
+// PUBLIC WAITLIST COUNT
+// GET /v1/waitlist/count
+// =====================================================
+
+func (h *Handler) Count(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	summary, err := h.service.GetSummary(r.Context())
+
+	if err != nil {
+		writeError(
+			w,
+			http.StatusInternalServerError,
+			"Unable to retrieve waitlist count.",
+		)
+		return
+	}
+
+	writeJSON(
+		w,
+		http.StatusOK,
+		countResponse{
+			TotalRegistered: summary.TotalRegistered,
+		},
+	)
+}
+
+// =====================================================
+// PUBLIC LAUNCH CONFIGURATION
+// GET /v1/waitlist/config
+// =====================================================
+
+func (h *Handler) GetConfig(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	info, err := h.service.GetLaunchInfo(r.Context())
+
+	if err != nil {
+		if errors.Is(err, ErrConfigNotFound) {
+			writeError(
+				w,
+				http.StatusServiceUnavailable,
+				"Launch information is not available yet.",
+			)
+			return
+		}
+
+		writeError(
+			w,
+			http.StatusInternalServerError,
+			"Unable to retrieve launch information.",
+		)
+		return
+	}
+
+	writeJSON(
+		w,
+		http.StatusOK,
+		configResponse{
+			LaunchAt: info.LaunchAt,
+			Timezone: info.Timezone,
+			Status:   info.Status,
+		},
+	)
+}
+
+// =====================================================
+// ADMIN LAUNCH CONFIGURATION
+// PUT /v1/admin/waitlist/config
+// =====================================================
+
+func (h *Handler) UpdateConfig(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	var request updateConfigRequest
+
+	if err := decodeJSON(w, r, &request); err != nil {
+		handleJSONDecodeError(w, err)
+		return
+	}
+
+	// Administrator identity must come from authenticated
+	// middleware, never from the incoming request body.
+	adminID, ok := r.Context().
+		Value(adminIDContextKey{}).(string)
+
+	if !ok || !validUUID(adminID) {
+		writeError(
+			w,
+			http.StatusUnauthorized,
+			"Administrator authentication required.",
+		)
+		return
+	}
+
+	config, err := h.service.UpdateLaunchConfig(
+		r.Context(),
+		WaitlistConfigInput{
+			LaunchAt:  request.LaunchAt,
+			Timezone:  request.Timezone,
+			UpdatedBy: &adminID,
+		},
+	)
+
+	if err != nil {
+		if errors.Is(err, ErrInvalidConfig) {
+			writeError(
+				w,
+				http.StatusUnprocessableEntity,
+				"Invalid launch date or timezone.",
+			)
+			return
+		}
+
+		writeError(
+			w,
+			http.StatusInternalServerError,
+			"Unable to update launch configuration.",
+		)
+		return
+	}
+
+	// Retrieve the authoritative status from the service.
+	// Do not assume every updated launch date is upcoming.
+	launchInfo, err := h.service.GetLaunchInfo(r.Context())
+
+	if err != nil {
+		writeError(
+			w,
+			http.StatusInternalServerError,
+			"Configuration was saved, but launch status could not be retrieved.",
+		)
+		return
+	}
+
+	writeJSON(
+		w,
+		http.StatusOK,
+		configResponse{
+			LaunchAt: config.LaunchAt,
+			Timezone: config.Timezone,
+			Status:   launchInfo.Status,
+		},
+	)
+}
+
+// =====================================================
+// SECURE UNSUBSCRIBE
+// POST /v1/waitlist/unsubscribe
+// =====================================================
+
+func (h *Handler) Unsubscribe(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	if h.tokens == nil {
+		writeError(
+			w,
+			http.StatusServiceUnavailable,
+			"Unsubscribe service is unavailable.",
+		)
+		return
+	}
+
+	var request unsubscribeRequest
+
+	if err := decodeJSON(w, r, &request); err != nil {
+		handleJSONDecodeError(w, err)
+		return
+	}
+
+	token := strings.TrimSpace(request.Token)
+
+	if token == "" {
+		writeError(
+			w,
+			http.StatusBadRequest,
+			"Unsubscribe token is required.",
+		)
+		return
+	}
+
+	// Verify the signed token before accessing registration data.
+	claims, err := h.tokens.Verify(token)
+
+	if err != nil {
+		writeError(
+			w,
+			http.StatusBadRequest,
+			"Invalid or expired unsubscribe link.",
+		)
+		return
+	}
+
+	// Process only the communication channel authorised
+	// by the signed token.
+	switch claims.Channel {
+
+	case UnsubscribeLaunchUpdates:
+
+		_, err = h.service.UnsubscribeLaunchUpdatesByID(
+			r.Context(),
+			claims.RegistrationID,
+		)
+
+	case UnsubscribeMarketing:
+
+		_, err = h.service.UnsubscribeMarketingByID(
+			r.Context(),
+			claims.RegistrationID,
+		)
+
+	default:
+
+		writeError(
+			w,
+			http.StatusBadRequest,
+			"Invalid unsubscribe request.",
+		)
+		return
+	}
+
+	if err != nil {
+		if errors.Is(err, ErrRegistrationNotFound) {
+			writeError(
+				w,
+				http.StatusNotFound,
+				"Registration not found.",
+			)
+			return
+		}
+
+		writeError(
+			w,
+			http.StatusInternalServerError,
+			"Unable to process unsubscribe request.",
+		)
+		return
+	}
+
+	writeJSON(
+		w,
+		http.StatusOK,
+		unsubscribeResponse{
+			Message: "Your communication preference has been updated.",
+		},
+	)
+}
+
+// validUUID checks whether a value has the standard UUID format.
+func validUUID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+
+	for i, character := range value {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if character != '-' {
+				return false
+			}
+			continue
+		}
+
+		if !((character >= '0' && character <= '9') ||
+			(character >= 'a' && character <= 'f') ||
+			(character >= 'A' && character <= 'F')) {
+			return false
+		}
+	}
+
+	return true
+}
+
+========================================
+FILE: internal/waitlist/routes.go
+========================================
+package waitlist
+
+import (
+	"net/http"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+)
+
+// =====================================================
+// ROUTE CONFIGURATION
+// =====================================================
+
+type RouteConfig struct {
+	AdminToken     string
+	AdminID        string
+	AllowedOrigins []string
+}
+
+// =====================================================
+// ROUTE REGISTRATION
+// =====================================================
+
+// RegisterRoutes registers all waitlist API endpoints.
+//
+// CORS is intentionally configured separately so the main
+// application can install it once at the router level.
+func RegisterRoutes(
+	router chi.Router,
+	handler *Handler,
+	config RouteConfig,
+) {
+	// Public registration rate limiter.
+	//
+	// Default:
+	// 5 registration attempts per IP address per minute.
+	registrationLimiter := NewRegistrationRateLimiter(
+		5,
+		time.Minute,
+	)
+
+	// -------------------------------------------------
+	// PUBLIC WAITLIST ENDPOINTS
+	// -------------------------------------------------
+
+	router.Route("/v1/waitlist", func(r chi.Router) {
+
+		// Register a resident.
+		r.With(
+			registrationLimiter.Middleware,
+		).Post(
+			"/register",
+			handler.Register,
+		)
+
+		// Return the total number of registrations.
+		r.Get(
+			"/count",
+			handler.Count,
+		)
+
+		// Return public launch information.
+		r.Get(
+			"/config",
+			handler.GetConfig,
+		)
+
+		// Process a signed unsubscribe token.
+		// POST prevents the token from being placed in
+		// the URL query string.
+		r.Post(
+			"/unsubscribe",
+			handler.Unsubscribe,
+		)
+	})
+
+	// -------------------------------------------------
+	// ADMINISTRATOR ENDPOINTS
+	// -------------------------------------------------
+
+	router.With(
+		AdminAuthMiddleware(
+			config.AdminToken,
+			config.AdminID,
+		),
+	).Put(
+		"/v1/admin/waitlist/config",
+		handler.UpdateConfig,
+	)
+}
+
+// =====================================================
+// STANDALONE HTTP HANDLER
+// =====================================================
+
+// NewHTTPHandler creates a standalone HTTP handler.
+//
+// Use this when the waitlist package is being served
+// independently. Do not use it inside app.NewServer
+// if CORS is already installed on the application router.
+func NewHTTPHandler(
+	service *Service,
+	tokens *UnsubscribeTokenManager,
+	config RouteConfig,
+) http.Handler {
+
+	router := chi.NewRouter()
+
+	handler := NewHandler(
+		service,
+		tokens,
+	)
+
+	// Apply CORS once at the router level.
+	router.Use(
+		CORSMiddleware(config.AllowedOrigins),
+	)
+
+	RegisterRoutes(
+		router,
+		handler,
+		config,
+	)
+
+	return router
+}
+
+========================================
+FILE: internal/waitlist/middleware.go
+========================================
+package waitlist
+
+import (
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// =====================================================
+// ADMIN AUTHENTICATION
+// =====================================================
+
+type adminIDContextKey struct{}
+
+// AdminAuthMiddleware protects administrator endpoints.
+//
+// The configured bearer token authenticates the request.
+// The configured administrator UUID identifies the actor
+// for database audit records.
+//
+// This is a single-administrator authentication mechanism.
+// It is not a multi-user identity management system.
+func AdminAuthMiddleware(
+	expectedToken string,
+	adminID string,
+) func(http.Handler) http.Handler {
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(
+			func(w http.ResponseWriter, r *http.Request) {
+
+				expectedToken = strings.TrimSpace(expectedToken)
+				adminID = strings.TrimSpace(adminID)
+
+				if len(expectedToken) < 32 || !validUUID(adminID) {
+					writeError(
+						w,
+						http.StatusServiceUnavailable,
+						"Administrator authentication is not configured.",
+					)
+					return
+				}
+
+				authorization := strings.TrimSpace(
+					r.Header.Get("Authorization"),
+				)
+
+				parts := strings.Fields(authorization)
+
+				if len(parts) != 2 ||
+					!strings.EqualFold(parts[0], "Bearer") {
+
+					writeError(
+						w,
+						http.StatusUnauthorized,
+						"Administrator authentication required.",
+					)
+					return
+				}
+
+				providedToken := parts[1]
+
+				providedHash := sha256.Sum256(
+					[]byte(providedToken),
+				)
+
+				expectedHash := sha256.Sum256(
+					[]byte(expectedToken),
+				)
+
+				if subtle.ConstantTimeCompare(
+					providedHash[:],
+					expectedHash[:],
+				) != 1 {
+
+					writeError(
+						w,
+						http.StatusUnauthorized,
+						"Invalid administrator credentials.",
+					)
+					return
+				}
+
+				// Identity comes from server configuration,
+				// never from client-supplied request data.
+				ctx := context.WithValue(
+					r.Context(),
+					adminIDContextKey{},
+					adminID,
+				)
+
+				next.ServeHTTP(
+					w,
+					r.WithContext(ctx),
+				)
+			},
+		)
+	}
+}
+
+// =====================================================
+// PUBLIC REGISTRATION RATE LIMITER
+// =====================================================
+
+type rateLimitEntry struct {
+	count       int
+	windowStart time.Time
+}
+
+type RegistrationRateLimiter struct {
+	mu sync.Mutex
+
+	entries map[string]rateLimitEntry
+
+	limit  int
+	window time.Duration
+	now    func() time.Time
+
+	// Avoid scanning the entire map on every request.
+	requestCount uint64
+}
+
+func NewRegistrationRateLimiter(
+	limit int,
+	window time.Duration,
+) *RegistrationRateLimiter {
+
+	if limit < 1 {
+		limit = 5
+	}
+
+	if window <= 0 {
+		window = time.Minute
+	}
+
+	return &RegistrationRateLimiter{
+		entries: make(map[string]rateLimitEntry),
+		limit:   limit,
+		window:  window,
+		now:     time.Now,
+	}
+}
+
+// clientIP obtains the immediate network peer address.
+//
+// Forwarded headers are deliberately not trusted here.
+// Only use forwarded IP addresses if the application
+// is behind a correctly configured trusted proxy.
+func clientIP(r *http.Request) string {
+	remoteAddr := strings.TrimSpace(r.RemoteAddr)
+
+	if remoteAddr == "" {
+		return "unknown"
+	}
+
+	host, _, err := net.SplitHostPort(remoteAddr)
+
+	if err == nil && host != "" {
+		return host
+	}
+
+	// Handles addresses without a port, including IPv6.
+	return remoteAddr
+}
+
+// Middleware applies a fixed-window registration limit.
+//
+// The default configured limit is five attempts per IP
+// address per minute.
+//
+// This limiter is process-local. It is not distributed
+// across multiple application instances.
+func (l *RegistrationRateLimiter) Middleware(
+	next http.Handler,
+) http.Handler {
+
+	return http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+
+			ip := clientIP(r)
+			now := l.now()
+
+			l.mu.Lock()
+
+			entry, exists := l.entries[ip]
+
+			if !exists ||
+				now.Sub(entry.windowStart) >= l.window {
+
+				entry = rateLimitEntry{
+					count:       0,
+					windowStart: now,
+				}
+			}
+
+			if entry.count >= l.limit {
+
+				retryAfter := l.window -
+					now.Sub(entry.windowStart)
+
+				if retryAfter < 0 {
+					retryAfter = 0
+				}
+
+				retrySeconds := int(
+					retryAfter.Seconds(),
+				) + 1
+
+				w.Header().Set(
+					"Retry-After",
+					strconv.Itoa(retrySeconds),
+				)
+
+				l.entries[ip] = entry
+
+				l.mu.Unlock()
+
+				writeError(
+					w,
+					http.StatusTooManyRequests,
+					"Too many registration attempts. Please try again later.",
+				)
+
+				return
+			}
+
+			entry.count++
+
+			l.entries[ip] = entry
+
+			l.requestCount++
+
+			// Opportunistically remove expired entries
+			// every 256 requests rather than scanning the
+			// map on every incoming registration request.
+			if l.requestCount%256 == 0 {
+
+				for key, value := range l.entries {
+
+					if now.Sub(value.windowStart) >= l.window {
+						delete(l.entries, key)
+					}
+				}
+			}
+
+			l.mu.Unlock()
+
+			next.ServeHTTP(w, r)
+		},
+	)
+}
+
+// =====================================================
+// CORS
+// =====================================================
+
+// CORSMiddleware permits requests only from explicitly
+// configured frontend origins.
+//
+// Wildcard origins and credentialed cross-origin requests
+// are deliberately not enabled.
+func CORSMiddleware(
+	allowedOrigins []string,
+) func(http.Handler) http.Handler {
+
+	allowed := make(map[string]struct{}, len(allowedOrigins))
+
+	for _, origin := range allowedOrigins {
+
+		origin = strings.TrimSpace(origin)
+
+		if origin == "" {
+			continue
+		}
+
+		allowed[origin] = struct{}{}
+	}
+
+	allowedMethods := "GET, POST, PUT, OPTIONS"
+	allowedHeaders := "Content-Type, Authorization"
+
+	return func(next http.Handler) http.Handler {
+
+		return http.HandlerFunc(
+			func(w http.ResponseWriter, r *http.Request) {
+
+				origin := strings.TrimSpace(
+					r.Header.Get("Origin"),
+				)
+
+				if origin != "" {
+
+					if _, ok := allowed[origin]; !ok {
+
+						writeError(
+							w,
+							http.StatusForbidden,
+							"Origin not allowed.",
+						)
+
+						return
+					}
+
+					w.Header().Set(
+						"Access-Control-Allow-Origin",
+						origin,
+					)
+
+					addVaryHeader(w, "Origin")
+
+					w.Header().Set(
+						"Access-Control-Allow-Methods",
+						allowedMethods,
+					)
+
+					w.Header().Set(
+						"Access-Control-Allow-Headers",
+						allowedHeaders,
+					)
+
+					w.Header().Set(
+						"Access-Control-Max-Age",
+						"600",
+					)
+				}
+
+				// Handle browser preflight requests.
+				if r.Method == http.MethodOptions {
+
+					if origin != "" {
+
+						requestedMethod := strings.TrimSpace(
+							r.Header.Get("Access-Control-Request-Method"),
+						)
+
+						if requestedMethod != "" &&
+							!isAllowedCORSMethod(requestedMethod) {
+
+							writeError(
+								w,
+								http.StatusForbidden,
+								"Requested method is not allowed.",
+							)
+
+							return
+						}
+
+						requestedHeaders := strings.TrimSpace(
+							r.Header.Get("Access-Control-Request-Headers"),
+						)
+
+						if requestedHeaders != "" &&
+							!areAllowedCORSHeaders(requestedHeaders) {
+
+							writeError(
+								w,
+								http.StatusForbidden,
+								"Requested headers are not allowed.",
+							)
+
+							return
+						}
+					}
+
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+
+				next.ServeHTTP(w, r)
+			},
+		)
+	}
+}
+
+// =====================================================
+// CORS HELPERS
+// =====================================================
+
+func isAllowedCORSMethod(method string) bool {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodGet,
+		http.MethodPost,
+		http.MethodPut:
+		return true
+
+	default:
+		return false
+	}
+}
+
+func areAllowedCORSHeaders(headers string) bool {
+
+	allowed := map[string]struct{}{
+		"content-type":  {},
+		"authorization": {},
+	}
+
+	for _, header := range strings.Split(headers, ",") {
+
+		header = strings.ToLower(
+			strings.TrimSpace(header),
+		)
+
+		if header == "" {
+			continue
+		}
+
+		if _, ok := allowed[header]; !ok {
+			return false
+		}
+	}
+
+	return true
+}
+
+// addVaryHeader preserves existing Vary values.
+func addVaryHeader(
+	w http.ResponseWriter,
+	value string,
+) {
+
+	for _, existing := range w.Header().Values("Vary") {
+
+		for _, item := range strings.Split(existing, ",") {
+
+			if strings.EqualFold(
+				strings.TrimSpace(item),
+				value,
+			) {
+				return
+			}
+		}
+	}
+
+	w.Header().Add("Vary", value)
+}
+
+========================================
+FILE: internal/waitlist/service.go
+========================================
+package waitlist
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+)
+
+// =====================================================
+// LAUNCH STATUS
+// =====================================================
+
+type LaunchStatus string
+
+const (
+	LaunchStatusUpcoming LaunchStatus = "UPCOMING"
+	LaunchStatusLaunched LaunchStatus = "LAUNCHED"
+)
+
+// =====================================================
+// SERVICE RESPONSE MODELS
+// =====================================================
+
+type LaunchInfo struct {
+	LaunchAt time.Time    `json:"launch_at"`
+	Timezone string       `json:"timezone"`
+	Status   LaunchStatus `json:"status"`
+}
+
+type WaitlistSummary struct {
+	TotalRegistered int64 `json:"total_registered"`
+}
+
+// =====================================================
+// SERVICE
+// =====================================================
+
+type Service struct {
+	repository Repository
+	clock      func() time.Time
+}
+
+func NewService(repository Repository) *Service {
+	return &Service{
+		repository: repository,
+		clock:      time.Now,
+	}
+}
+
+// =====================================================
+// REGISTRATION
+// =====================================================
+
+func (s *Service) Register(
+	ctx context.Context,
+	input RegistrationInput,
+) (RegistrationResult, error) {
+
+	// Validate and normalise the email before
+	// forwarding the request to the repository.
+	email, err := NormalizeEmail(input.Email)
+	if err != nil {
+		return RegistrationResult{}, ErrInvalidEmail
+	}
+
+	input.Email = email
+
+	result, err := s.repository.Register(ctx, input)
+	if err != nil {
+		return RegistrationResult{}, fmt.Errorf(
+			"register waitlist resident: %w",
+			err,
+		)
+	}
+
+	return result, nil
+}
+
+// =====================================================
+// REGISTRATION LOOKUP
+// =====================================================
+
+func (s *Service) GetRegistrationByEmail(
+	ctx context.Context,
+	email string,
+) (Registration, error) {
+
+	normalised, err := NormalizeEmail(email)
+	if err != nil {
+		return Registration{}, ErrInvalidEmail
+	}
+
+	registration, err := s.repository.GetRegistrationByEmail(
+		ctx,
+		normalised,
+	)
+
+	if err != nil {
+		return Registration{}, fmt.Errorf(
+			"retrieve waitlist registration: %w",
+			err,
+		)
+	}
+
+	return registration, nil
+}
+
+// =====================================================
+// TOTAL REGISTRATION COUNT
+// =====================================================
+
+func (s *Service) GetSummary(
+	ctx context.Context,
+) (WaitlistSummary, error) {
+
+	total, err := s.repository.GetTotalRegistered(ctx)
+	if err != nil {
+		return WaitlistSummary{}, fmt.Errorf(
+			"retrieve waitlist summary: %w",
+			err,
+		)
+	}
+
+	return WaitlistSummary{
+		TotalRegistered: total,
+	}, nil
+}
+
+// =====================================================
+// LAUNCH CONFIGURATION
+// =====================================================
+
+func (s *Service) GetLaunchInfo(
+	ctx context.Context,
+) (LaunchInfo, error) {
+
+	config, err := s.repository.GetConfig(ctx)
+	if err != nil {
+		return LaunchInfo{}, fmt.Errorf(
+			"retrieve launch configuration: %w",
+			err,
+		)
+	}
+
+	status := LaunchStatusUpcoming
+
+	if !s.clock().Before(config.LaunchAt) {
+		status = LaunchStatusLaunched
+	}
+
+	return LaunchInfo{
+		LaunchAt: config.LaunchAt,
+		Timezone: config.Timezone,
+		Status:   status,
+	}, nil
+}
+
+// =====================================================
+// UPDATE LAUNCH CONFIGURATION
+// =====================================================
+
+func (s *Service) UpdateLaunchConfig(
+	ctx context.Context,
+	input WaitlistConfigInput,
+) (WaitlistConfig, error) {
+
+	input.Timezone = strings.TrimSpace(input.Timezone)
+
+	if input.LaunchAt.IsZero() || input.Timezone == "" {
+		return WaitlistConfig{}, ErrInvalidConfig
+	}
+
+	if _, err := time.LoadLocation(input.Timezone); err != nil {
+		return WaitlistConfig{}, ErrInvalidConfig
+	}
+
+	config, err := s.repository.UpdateConfig(ctx, input)
+	if err != nil {
+		return WaitlistConfig{}, fmt.Errorf(
+			"update launch configuration: %w",
+			err,
+		)
+	}
+
+	return config, nil
+}
+
+// =====================================================
+// CONSENT
+// =====================================================
+
+// Consent choices are collected explicitly at registration.
+// The repository persists the choices and their recording time.
+// A duplicate registration does not silently change consent.
+
+// =====================================================
+// UNSUBSCRIBE FROM LAUNCH UPDATES
+// =====================================================
+
+func (s *Service) UnsubscribeLaunchUpdates(
+	ctx context.Context,
+	email string,
+) (Registration, error) {
+
+	normalised, err := NormalizeEmail(email)
+	if err != nil {
+		return Registration{}, ErrInvalidEmail
+	}
+
+	registration, err := s.repository.UnsubscribeLaunchUpdates(
+		ctx,
+		normalised,
+	)
+
+	if err != nil {
+		if errors.Is(err, ErrRegistrationNotFound) {
+			return Registration{}, ErrRegistrationNotFound
+		}
+
+		return Registration{}, fmt.Errorf(
+			"unsubscribe from launch updates: %w",
+			err,
+		)
+	}
+
+	return registration, nil
+}
+
+// =====================================================
+// UNSUBSCRIBE FROM MARKETING
+// =====================================================
+
+func (s *Service) UnsubscribeMarketing(
+	ctx context.Context,
+	email string,
+) (Registration, error) {
+
+	normalised, err := NormalizeEmail(email)
+	if err != nil {
+		return Registration{}, ErrInvalidEmail
+	}
+
+	registration, err := s.repository.UnsubscribeMarketing(
+		ctx,
+		normalised,
+	)
+
+	if err != nil {
+		if errors.Is(err, ErrRegistrationNotFound) {
+			return Registration{}, ErrRegistrationNotFound
+		}
+
+		return Registration{}, fmt.Errorf(
+			"unsubscribe from marketing: %w",
+			err,
+		)
+	}
+
+	return registration, nil
+}
+
+func (s *Service) UnsubscribeLaunchUpdatesByID(
+	ctx context.Context,
+	registrationID string,
+) (Registration, error) {
+
+	if registrationID == "" {
+		return Registration{}, ErrInvalidUnsubscribeToken
+	}
+
+	registration, err := s.repository.UnsubscribeLaunchUpdatesByID(
+		ctx,
+		registrationID,
+	)
+
+	if err != nil {
+		if errors.Is(err, ErrRegistrationNotFound) {
+			return Registration{}, ErrRegistrationNotFound
+		}
+
+		return Registration{}, fmt.Errorf(
+			"unsubscribe from launch updates: %w",
+			err,
+		)
+	}
+
+	return registration, nil
+}
+
+func (s *Service) UnsubscribeMarketingByID(
+	ctx context.Context,
+	registrationID string,
+) (Registration, error) {
+
+	if registrationID == "" {
+		return Registration{}, ErrInvalidUnsubscribeToken
+	}
+
+	registration, err := s.repository.UnsubscribeMarketingByID(
+		ctx,
+		registrationID,
+	)
+
+	if err != nil {
+		if errors.Is(err, ErrRegistrationNotFound) {
+			return Registration{}, ErrRegistrationNotFound
+		}
+
+		return Registration{}, fmt.Errorf(
+			"unsubscribe from marketing: %w",
+			err,
+		)
+	}
+
+	return registration, nil
+}
+
+========================================
+FILE: internal/waitlist/unsubscribe_token.go
+========================================
+package waitlist
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+)
+
+var ErrInvalidUnsubscribeToken = errors.New("invalid or expired unsubscribe token")
+
+type UnsubscribeChannel string
+
+const (
+	UnsubscribeLaunchUpdates UnsubscribeChannel = "launch_updates"
+	UnsubscribeMarketing     UnsubscribeChannel = "marketing"
+)
+
+type UnsubscribeClaims struct {
+	RegistrationID string             `json:"rid"`
+	Channel        UnsubscribeChannel `json:"channel"`
+	ExpiresAt      int64              `json:"exp"`
+}
+
+type UnsubscribeTokenManager struct {
+	secret []byte
+	clock  func() time.Time
+}
+
+func NewUnsubscribeTokenManager(secret string) (*UnsubscribeTokenManager, error) {
+	if len(secret) < 32 {
+		return nil, errors.New(
+			"unsubscribe token secret must contain at least 32 characters",
+		)
+	}
+
+	return &UnsubscribeTokenManager{
+		secret: []byte(secret),
+		clock:  time.Now,
+	}, nil
+}
+
+func (m *UnsubscribeTokenManager) Generate(
+	registrationID string,
+	channel UnsubscribeChannel,
+	expiresAt time.Time,
+) (string, error) {
+
+	if strings.TrimSpace(registrationID) == "" {
+		return "", ErrInvalidUnsubscribeToken
+	}
+
+	if channel != UnsubscribeLaunchUpdates &&
+		channel != UnsubscribeMarketing {
+		return "", ErrInvalidUnsubscribeToken
+	}
+
+	if !expiresAt.After(m.clock()) {
+		return "", ErrInvalidUnsubscribeToken
+	}
+
+	claims := UnsubscribeClaims{
+		RegistrationID: registrationID,
+		Channel:        channel,
+		ExpiresAt:      expiresAt.Unix(),
+	}
+
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return "", fmt.Errorf("encode unsubscribe claims: %w", err)
+	}
+
+	encodedPayload := base64.RawURLEncoding.EncodeToString(payload)
+	signature := m.sign(encodedPayload)
+
+	return encodedPayload + "." +
+		base64.RawURLEncoding.EncodeToString(signature), nil
+}
+
+func (m *UnsubscribeTokenManager) Verify(
+	token string,
+) (UnsubscribeClaims, error) {
+
+	parts := strings.Split(token, ".")
+	if len(parts) != 2 {
+		return UnsubscribeClaims{}, ErrInvalidUnsubscribeToken
+	}
+
+	providedSignature, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return UnsubscribeClaims{}, ErrInvalidUnsubscribeToken
+	}
+
+	expectedSignature := m.sign(parts[0])
+
+	if !hmac.Equal(providedSignature, expectedSignature) {
+		return UnsubscribeClaims{}, ErrInvalidUnsubscribeToken
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return UnsubscribeClaims{}, ErrInvalidUnsubscribeToken
+	}
+
+	var claims UnsubscribeClaims
+
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return UnsubscribeClaims{}, ErrInvalidUnsubscribeToken
+	}
+
+	if claims.RegistrationID == "" ||
+		(claims.Channel != UnsubscribeLaunchUpdates &&
+			claims.Channel != UnsubscribeMarketing) ||
+		claims.ExpiresAt <= m.clock().Unix() {
+		return UnsubscribeClaims{}, ErrInvalidUnsubscribeToken
+	}
+
+	return claims, nil
+}
+
+func (m *UnsubscribeTokenManager) sign(payload string) []byte {
+	mac := hmac.New(sha256.New, m.secret)
+	_, _ = mac.Write([]byte(payload))
+	return mac.Sum(nil)
+}
+
+========================================
+FILE: internal/waitlist/repository.go
+========================================
+package waitlist
+
+import "context"
+
+type Repository interface {
+	Register(context.Context, RegistrationInput) (RegistrationResult, error)
+
+	GetRegistrationByEmail(context.Context, string) (Registration, error)
+
+	GetTotalRegistered(context.Context) (int64, error)
+
+	GetConfig(context.Context) (WaitlistConfig, error)
+
+	UpdateConfig(context.Context, WaitlistConfigInput) (WaitlistConfig, error)
+
+	UnsubscribeLaunchUpdates(context.Context, string) (Registration, error)
+
+	UnsubscribeMarketing(context.Context, string) (Registration, error)
+
+	UnsubscribeLaunchUpdatesByID(context.Context, string) (Registration, error)
+
+	UnsubscribeMarketingByID(context.Context, string) (Registration, error)
+}
+
+========================================
+FILE: internal/waitlist/postgres_repository.go
+========================================
+package waitlist
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
+)
+
+const (
+	registrationTable = "waitlist.waitlist_registration"
+	counterTable      = "waitlist.waitlist_counter"
+	configTable       = "waitlist.waitlist_config"
+	auditTable        = "waitlist.waitlist_admin_audit"
+)
+
+const registrationColumns = `
+	registration_id,
+	email,
+	position,
+	launch_updates_consent,
+	marketing_consent,
+	consent_recorded_at,
+	launch_updates_unsubscribed_at,
+	marketing_unsubscribed_at,
+	created_at
+`
+
+// PostgreSQLDB is implemented by pgxpool.Pool.
+type PostgreSQLDB interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+
+	QueryRow(
+		ctx context.Context,
+		sql string,
+		args ...any,
+	) pgx.Row
+
+	Exec(
+		ctx context.Context,
+		sql string,
+		args ...any,
+	) (pgconn.CommandTag, error)
+}
+
+type PostgresRepository struct {
+	db PostgreSQLDB
+}
+
+func NewPostgresRepository(db PostgreSQLDB) *PostgresRepository {
+	return &PostgresRepository{
+		db: db,
+	}
+}
+
+// =====================================================
+// UUID GENERATION
+// =====================================================
+
+// generateUUID creates an RFC 4122 version 4 UUID.
+func generateUUID() (string, error) {
+	var id [16]byte
+
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", fmt.Errorf("generate UUID: %w", err)
+	}
+
+	id[6] = (id[6] & 0x0f) | 0x40
+	id[8] = (id[8] & 0x3f) | 0x80
+
+	encoded := hex.EncodeToString(id[:])
+
+	return encoded[0:8] + "-" +
+		encoded[8:12] + "-" +
+		encoded[12:16] + "-" +
+		encoded[16:20] + "-" +
+		encoded[20:32], nil
+}
+
+// =====================================================
+// TRANSACTION CLEANUP
+// =====================================================
+
+func rollbackTransaction(tx pgx.Tx) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancel()
+
+	// A rollback after a successful commit is harmless.
+	_ = tx.Rollback(ctx)
+}
+
+// =====================================================
+// REGISTRATION
+// =====================================================
+
+func (r *PostgresRepository) Register(
+	ctx context.Context,
+	input RegistrationInput,
+) (RegistrationResult, error) {
+
+	if r.db == nil {
+		return RegistrationResult{}, errors.New(
+			"waitlist database is unavailable",
+		)
+	}
+
+	email, err := NormalizeEmail(input.Email)
+	if err != nil {
+		return RegistrationResult{}, err
+	}
+
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return RegistrationResult{}, fmt.Errorf(
+			"begin registration transaction: %w",
+			err,
+		)
+	}
+
+	defer rollbackTransaction(tx)
+
+	// 1. Lock the counter row.
+	//
+	// This serialises new registrations. The counter update
+	// and registration insert occur in the same transaction.
+	var lastPosition int64
+
+	err = tx.QueryRow(
+		ctx,
+		`
+			SELECT last_position
+			FROM `+counterTable+`
+			WHERE counter_id = 1
+			FOR UPDATE
+		`,
+	).Scan(&lastPosition)
+
+	if err != nil {
+		return RegistrationResult{}, fmt.Errorf(
+			"lock waitlist counter: %w",
+			err,
+		)
+	}
+
+	// 2. Check whether this email is already registered.
+	//
+	// Existing registrations retain their original position
+	// and consent preferences. Duplicate submissions do not
+	// silently change previously recorded consent.
+	existing, err := scanRegistration(
+		tx.QueryRow(
+			ctx,
+			`
+				SELECT `+registrationColumns+`
+				FROM `+registrationTable+`
+				WHERE email = $1
+			`,
+			email,
+		),
+	)
+
+	if err == nil {
+		var total int64
+
+		err = tx.QueryRow(
+			ctx,
+			`
+				SELECT COUNT(*)
+				FROM `+registrationTable+`
+			`,
+		).Scan(&total)
+
+		if err != nil {
+			return RegistrationResult{}, fmt.Errorf(
+				"count waitlist registrations: %w",
+				err,
+			)
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return RegistrationResult{}, fmt.Errorf(
+				"commit duplicate registration lookup: %w",
+				err,
+			)
+		}
+
+		return RegistrationResult{
+			Registration:    existing,
+			IsExisting:      true,
+			TotalRegistered: total,
+		}, nil
+	}
+
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return RegistrationResult{}, fmt.Errorf(
+			"check existing registration: %w",
+			err,
+		)
+	}
+
+	// 3. Allocate the next permanent position.
+	//
+	// The counter update rolls back if the subsequent insert
+	// or transaction commit fails.
+	var nextPosition int64
+
+	err = tx.QueryRow(
+		ctx,
+		`
+			UPDATE `+counterTable+`
+			SET last_position = last_position + 1
+			WHERE counter_id = 1
+			RETURNING last_position
+		`,
+	).Scan(&nextPosition)
+
+	if err != nil {
+		return RegistrationResult{}, fmt.Errorf(
+			"allocate waitlist position: %w",
+			err,
+		)
+	}
+
+	// 4. Generate registration ID.
+	registrationID, err := generateUUID()
+	if err != nil {
+		return RegistrationResult{}, err
+	}
+
+	// 5. Insert the registration.
+	var registration Registration
+
+	err = tx.QueryRow(
+		ctx,
+		`
+			INSERT INTO `+registrationTable+` (
+				registration_id,
+				email,
+				position,
+				launch_updates_consent,
+				marketing_consent,
+				consent_recorded_at
+			)
+			VALUES ($1, $2, $3, $4, $5, NOW())
+			RETURNING `+registrationColumns,
+		registrationID,
+		email,
+		nextPosition,
+		input.LaunchUpdatesConsent,
+		input.MarketingConsent,
+	).Scan(
+		&registration.RegistrationID,
+		&registration.Email,
+		&registration.Position,
+		&registration.LaunchUpdatesConsent,
+		&registration.MarketingConsent,
+		&registration.ConsentRecordedAt,
+		&registration.LaunchUpdatesUnsubscribedAt,
+		&registration.MarketingUnsubscribedAt,
+		&registration.CreatedAt,
+	)
+
+	if err != nil {
+		return RegistrationResult{}, fmt.Errorf(
+			"insert waitlist registration: %w",
+			err,
+		)
+	}
+
+	// 6. Retrieve the genuine registration count.
+	var total int64
+
+	err = tx.QueryRow(
+		ctx,
+		`
+			SELECT COUNT(*)
+			FROM `+registrationTable+`
+		`,
+	).Scan(&total)
+
+	if err != nil {
+		return RegistrationResult{}, fmt.Errorf(
+			"count waitlist registrations: %w",
+			err,
+		)
+	}
+
+	// 7. Commit the counter and registration together.
+	if err := tx.Commit(ctx); err != nil {
+		return RegistrationResult{}, fmt.Errorf(
+			"commit waitlist registration: %w",
+			err,
+		)
+	}
+
+	return RegistrationResult{
+		Registration:    registration,
+		IsExisting:      false,
+		TotalRegistered: total,
+	}, nil
+}
+
+// =====================================================
+// REGISTRATION LOOKUP
+// =====================================================
+
+func (r *PostgresRepository) GetRegistrationByEmail(
+	ctx context.Context,
+	email string,
+) (Registration, error) {
+
+	if r.db == nil {
+		return Registration{}, errors.New(
+			"waitlist database is unavailable",
+		)
+	}
+
+	normalised, err := NormalizeEmail(email)
+	if err != nil {
+		return Registration{}, err
+	}
+
+	return scanRegistration(
+		r.db.QueryRow(
+			ctx,
+			`
+				SELECT `+registrationColumns+`
+				FROM `+registrationTable+`
+				WHERE email = $1
+			`,
+			normalised,
+		),
+	)
+}
+
+// =====================================================
+// REGISTRATION COUNT
+// =====================================================
+
+func (r *PostgresRepository) GetTotalRegistered(
+	ctx context.Context,
+) (int64, error) {
+
+	if r.db == nil {
+		return 0, errors.New(
+			"waitlist database is unavailable",
+		)
+	}
+
+	var total int64
+
+	err := r.db.QueryRow(
+		ctx,
+		`
+			SELECT COUNT(*)
+			FROM `+registrationTable+`
+		`,
+	).Scan(&total)
+
+	if err != nil {
+		return 0, fmt.Errorf(
+			"get total registrations: %w",
+			err,
+		)
+	}
+
+	return total, nil
+}
+
+// =====================================================
+// WAITLIST CONFIGURATION
+// =====================================================
+
+func (r *PostgresRepository) GetConfig(
+	ctx context.Context,
+) (WaitlistConfig, error) {
+
+	if r.db == nil {
+		return WaitlistConfig{}, errors.New(
+			"waitlist database is unavailable",
+		)
+	}
+
+	var config WaitlistConfig
+	var updatedBy pgtype.Text
+
+	err := r.db.QueryRow(
+		ctx,
+		`
+			SELECT
+				config_id,
+				launch_at,
+				timezone,
+				updated_at,
+				updated_by
+			FROM `+configTable+`
+			WHERE config_key = 'default'
+		`,
+	).Scan(
+		&config.ConfigID,
+		&config.LaunchAt,
+		&config.Timezone,
+		&config.UpdatedAt,
+		&updatedBy,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return WaitlistConfig{}, ErrConfigNotFound
+	}
+
+	if err != nil {
+		return WaitlistConfig{}, fmt.Errorf(
+			"get waitlist configuration: %w",
+			err,
+		)
+	}
+
+	if updatedBy.Valid {
+		value := updatedBy.String
+		config.UpdatedBy = &value
+	}
+
+	return config, nil
+}
+
+// =====================================================
+// UPDATE WAITLIST CONFIGURATION
+// =====================================================
+
+func (r *PostgresRepository) UpdateConfig(
+	ctx context.Context,
+	input WaitlistConfigInput,
+) (WaitlistConfig, error) {
+
+	if r.db == nil {
+		return WaitlistConfig{}, errors.New(
+			"waitlist database is unavailable",
+		)
+	}
+
+	timezone := strings.TrimSpace(input.Timezone)
+
+	if timezone == "" || input.LaunchAt.IsZero() {
+		return WaitlistConfig{}, ErrInvalidConfig
+	}
+
+	if _, err := time.LoadLocation(timezone); err != nil {
+		return WaitlistConfig{}, ErrInvalidConfig
+	}
+
+	if input.UpdatedBy == nil {
+		return WaitlistConfig{}, ErrInvalidConfig
+	}
+
+	adminID := strings.TrimSpace(*input.UpdatedBy)
+
+	if !validUUID(adminID) {
+		return WaitlistConfig{}, ErrInvalidConfig
+	}
+
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return WaitlistConfig{}, fmt.Errorf(
+			"begin configuration update: %w",
+			err,
+		)
+	}
+
+	defer rollbackTransaction(tx)
+
+	// 1. Acquire the shared counter lock.
+	//
+	// The counter is a permanent singleton row. Using it here
+	// serialises configuration updates, including the case
+	// where the default configuration does not exist yet.
+	var lastPosition int64
+
+	err = tx.QueryRow(
+		ctx,
+		`
+			SELECT last_position
+			FROM `+counterTable+`
+			WHERE counter_id = 1
+			FOR UPDATE
+		`,
+	).Scan(&lastPosition)
+
+	if err != nil {
+		return WaitlistConfig{}, fmt.Errorf(
+			"lock waitlist configuration: %w",
+			err,
+		)
+	}
+
+	// 2. Read the previous configuration.
+	var previousLaunchAt pgtype.Timestamptz
+	var previousTimezone pgtype.Text
+
+	err = tx.QueryRow(
+		ctx,
+		`
+			SELECT launch_at, timezone
+			FROM `+configTable+`
+			WHERE config_key = 'default'
+			FOR UPDATE
+		`,
+	).Scan(
+		&previousLaunchAt,
+		&previousTimezone,
+	)
+
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return WaitlistConfig{}, fmt.Errorf(
+			"read previous launch configuration: %w",
+			err,
+		)
+	}
+
+	// 3. Generate a new configuration UUID.
+	configID, err := generateUUID()
+	if err != nil {
+		return WaitlistConfig{}, err
+	}
+
+	// 4. Insert or update the configuration.
+	var config WaitlistConfig
+
+	err = tx.QueryRow(
+		ctx,
+		`
+			INSERT INTO `+configTable+` (
+				config_id,
+				config_key,
+				launch_at,
+				timezone,
+				updated_at,
+				updated_by
+			)
+			VALUES ($1, 'default', $2, $3, NOW(), $4)
+			ON CONFLICT (config_key)
+			DO UPDATE SET
+				launch_at = EXCLUDED.launch_at,
+				timezone = EXCLUDED.timezone,
+				updated_at = NOW(),
+				updated_by = EXCLUDED.updated_by
+			RETURNING
+				config_id,
+				launch_at,
+				timezone,
+				updated_at,
+				updated_by
+		`,
+		configID,
+		input.LaunchAt,
+		timezone,
+		adminID,
+	).Scan(
+		&config.ConfigID,
+		&config.LaunchAt,
+		&config.Timezone,
+		&config.UpdatedAt,
+		&config.UpdatedBy,
+	)
+
+	if err != nil {
+		return WaitlistConfig{}, fmt.Errorf(
+			"update waitlist configuration: %w",
+			err,
+		)
+	}
+
+	// 5. Generate an independent audit ID.
+	auditID, err := generateUUID()
+	if err != nil {
+		return WaitlistConfig{}, err
+	}
+
+	// Convert nullable previous values into SQL parameters.
+	var previousLaunchValue any
+	var previousTimezoneValue any
+
+	if previousLaunchAt.Valid {
+		previousLaunchValue = previousLaunchAt.Time
+	}
+
+	if previousTimezone.Valid {
+		previousTimezoneValue = previousTimezone.String
+	}
+
+	// 6. Record the administrator's change.
+	//
+	// Configuration update and audit insertion are part of
+	// the same transaction. If audit insertion fails, the
+	// configuration change also rolls back.
+	_, err = tx.Exec(
+		ctx,
+		`
+			INSERT INTO `+auditTable+` (
+				audit_id,
+				admin_id,
+				action,
+				previous_launch_at,
+				new_launch_at,
+				previous_timezone,
+				new_timezone
+			)
+			VALUES (
+				$1,
+				$2,
+				'UPDATE_LAUNCH_CONFIG',
+				$3,
+				$4,
+				$5,
+				$6
+			)
+		`,
+		auditID,
+		adminID,
+		previousLaunchValue,
+		config.LaunchAt,
+		previousTimezoneValue,
+		config.Timezone,
+	)
+
+	if err != nil {
+		return WaitlistConfig{}, fmt.Errorf(
+			"record configuration audit: %w",
+			err,
+		)
+	}
+
+	// 7. Commit configuration and audit together.
+	if err := tx.Commit(ctx); err != nil {
+		return WaitlistConfig{}, fmt.Errorf(
+			"commit configuration update: %w",
+			err,
+		)
+	}
+
+	return config, nil
+}
+
+// =====================================================
+// SHARED REGISTRATION SCANNER
+// =====================================================
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanRegistration(
+	row rowScanner,
+) (Registration, error) {
+
+	var registration Registration
+
+	var launchUnsubscribedAt pgtype.Timestamptz
+	var marketingUnsubscribedAt pgtype.Timestamptz
+
+	err := row.Scan(
+		&registration.RegistrationID,
+		&registration.Email,
+		&registration.Position,
+		&registration.LaunchUpdatesConsent,
+		&registration.MarketingConsent,
+		&registration.ConsentRecordedAt,
+		&launchUnsubscribedAt,
+		&marketingUnsubscribedAt,
+		&registration.CreatedAt,
+	)
+
+	if err != nil {
+		return Registration{}, err
+	}
+
+	if launchUnsubscribedAt.Valid {
+		value := launchUnsubscribedAt.Time
+		registration.LaunchUpdatesUnsubscribedAt = &value
+	}
+
+	if marketingUnsubscribedAt.Valid {
+		value := marketingUnsubscribedAt.Time
+		registration.MarketingUnsubscribedAt = &value
+	}
+
+	return registration, nil
+}
+
+// =====================================================
+// UNSUBSCRIBE HELPERS
+// =====================================================
+
+func (r *PostgresRepository) unsubscribeByEmail(
+	ctx context.Context,
+	email string,
+	channel UnsubscribeChannel,
+) (Registration, error) {
+
+	if r.db == nil {
+		return Registration{}, errors.New(
+			"waitlist database is unavailable",
+		)
+	}
+
+	normalised, err := NormalizeEmail(email)
+	if err != nil {
+		return Registration{}, err
+	}
+
+	var query string
+
+	switch channel {
+
+	case UnsubscribeLaunchUpdates:
+		query = `
+			UPDATE ` + registrationTable + `
+			SET
+				launch_updates_consent = FALSE,
+				launch_updates_unsubscribed_at =
+					COALESCE(launch_updates_unsubscribed_at, NOW())
+			WHERE email = $1
+			RETURNING ` + registrationColumns
+
+	case UnsubscribeMarketing:
+		query = `
+			UPDATE ` + registrationTable + `
+			SET
+				marketing_consent = FALSE,
+				marketing_unsubscribed_at =
+					COALESCE(marketing_unsubscribed_at, NOW())
+			WHERE email = $1
+			RETURNING ` + registrationColumns
+
+	default:
+		return Registration{}, ErrInvalidUnsubscribeToken
+	}
+
+	registration, err := scanRegistration(
+		r.db.QueryRow(ctx, query, normalised),
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Registration{}, ErrRegistrationNotFound
+	}
+
+	if err != nil {
+		return Registration{}, fmt.Errorf(
+			"unsubscribe registration by email: %w",
+			err,
+		)
+	}
+
+	return registration, nil
+}
+
+// =====================================================
+// UNSUBSCRIBE BY EMAIL
+// Internal repository operations only.
+// Public unsubscribe requests must use signed tokens.
+// =====================================================
+
+func (r *PostgresRepository) UnsubscribeLaunchUpdates(
+	ctx context.Context,
+	email string,
+) (Registration, error) {
+
+	return r.unsubscribeByEmail(
+		ctx,
+		email,
+		UnsubscribeLaunchUpdates,
+	)
+}
+
+func (r *PostgresRepository) UnsubscribeMarketing(
+	ctx context.Context,
+	email string,
+) (Registration, error) {
+
+	return r.unsubscribeByEmail(
+		ctx,
+		email,
+		UnsubscribeMarketing,
+	)
+}
+
+// =====================================================
+// UNSUBSCRIBE BY REGISTRATION ID
+// =====================================================
+
+func (r *PostgresRepository) unsubscribeByID(
+	ctx context.Context,
+	registrationID string,
+	channel UnsubscribeChannel,
+) (Registration, error) {
+
+	if r.db == nil {
+		return Registration{}, errors.New(
+			"waitlist database is unavailable",
+		)
+	}
+
+	registrationID = strings.TrimSpace(registrationID)
+
+	if !validUUID(registrationID) {
+		return Registration{}, ErrInvalidUnsubscribeToken
+	}
+
+	var query string
+
+	switch channel {
+
+	case UnsubscribeLaunchUpdates:
+		query = `
+			UPDATE ` + registrationTable + `
+			SET
+				launch_updates_consent = FALSE,
+				launch_updates_unsubscribed_at =
+					COALESCE(launch_updates_unsubscribed_at, NOW())
+			WHERE registration_id = $1
+			RETURNING ` + registrationColumns
+
+	case UnsubscribeMarketing:
+		query = `
+			UPDATE ` + registrationTable + `
+			SET
+				marketing_consent = FALSE,
+				marketing_unsubscribed_at =
+					COALESCE(marketing_unsubscribed_at, NOW())
+			WHERE registration_id = $1
+			RETURNING ` + registrationColumns
+
+	default:
+		return Registration{}, ErrInvalidUnsubscribeToken
+	}
+
+	registration, err := scanRegistration(
+		r.db.QueryRow(
+			ctx,
+			query,
+			registrationID,
+		),
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Registration{}, ErrRegistrationNotFound
+	}
+
+	if err != nil {
+		return Registration{}, fmt.Errorf(
+			"unsubscribe registration by ID: %w",
+			err,
+		)
+	}
+
+	return registration, nil
+}
+
+func (r *PostgresRepository) UnsubscribeLaunchUpdatesByID(
+	ctx context.Context,
+	registrationID string,
+) (Registration, error) {
+
+	return r.unsubscribeByID(
+		ctx,
+		registrationID,
+		UnsubscribeLaunchUpdates,
+	)
+}
+
+func (r *PostgresRepository) UnsubscribeMarketingByID(
+	ctx context.Context,
+	registrationID string,
+) (Registration, error) {
+
+	return r.unsubscribeByID(
+		ctx,
+		registrationID,
+		UnsubscribeMarketing,
+	)
+}
+
+========================================
+FILE: internal/waitlist/handler_test.go
+========================================
+package waitlist
+
+========================================
+FILE: internal/waitlist/security_test.go
+========================================
+package waitlist
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+)
+
+// =====================================================
+// TEST HELPERS
+// =====================================================
+
+const (
+	testAdminToken = "test-admin-token-with-at-least-32-characters"
+	testAdminID    = "550e8400-e29b-41d4-a716-446655440000"
+)
+
+func newTestRequest(
+	method string,
+	target string,
+) *http.Request {
+	return httptest.NewRequest(method, target, nil)
+}
+
+func newTestResponse(
+	handler http.Handler,
+	request *http.Request,
+) *httptest.ResponseRecorder {
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	return recorder
+}
+
+// =====================================================
+// ADMIN AUTHENTICATION TESTS
+// =====================================================
+
+func TestAdminAuthMiddleware_RejectsMissingAuthorization(t *testing.T) {
+	middleware := AdminAuthMiddleware(
+		testAdminToken,
+		testAdminID,
+	)
+
+	protectedHandler := middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Fatal("protected handler should not be reached")
+		}),
+	)
+
+	request := newTestRequest(
+		http.MethodPut,
+		"/v1/admin/waitlist/config",
+	)
+
+	response := newTestResponse(
+		protectedHandler,
+		request,
+	)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusUnauthorized,
+			response.Code,
+		)
+	}
+}
+
+func TestAdminAuthMiddleware_RejectsInvalidToken(t *testing.T) {
+	middleware := AdminAuthMiddleware(
+		testAdminToken,
+		testAdminID,
+	)
+
+	protectedHandler := middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Fatal("protected handler should not be reached")
+		}),
+	)
+
+	request := newTestRequest(
+		http.MethodPut,
+		"/v1/admin/waitlist/config",
+	)
+
+	request.Header.Set(
+		"Authorization",
+		"Bearer incorrect-administrator-token",
+	)
+
+	response := newTestResponse(
+		protectedHandler,
+		request,
+	)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusUnauthorized,
+			response.Code,
+		)
+	}
+}
+
+func TestAdminAuthMiddleware_RejectsMalformedAuthorization(t *testing.T) {
+	testCases := []struct {
+		name  string
+		value string
+	}{
+		{
+			name:  "missing bearer prefix",
+			value: testAdminToken,
+		},
+		{
+			name:  "empty bearer token",
+			value: "Bearer ",
+		},
+		{
+			name:  "multiple tokens",
+			value: "Bearer token extra",
+		},
+		{
+			name:  "wrong authentication scheme",
+			value: "Basic " + testAdminToken,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			middleware := AdminAuthMiddleware(
+				testAdminToken,
+				testAdminID,
+			)
+
+			protectedHandler := middleware(
+				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					t.Fatal("protected handler should not be reached")
+				}),
+			)
+
+			request := newTestRequest(
+				http.MethodPut,
+				"/v1/admin/waitlist/config",
+			)
+
+			request.Header.Set(
+				"Authorization",
+				testCase.value,
+			)
+
+			response := newTestResponse(
+				protectedHandler,
+				request,
+			)
+
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf(
+					"expected status %d, got %d",
+					http.StatusUnauthorized,
+					response.Code,
+				)
+			}
+		})
+	}
+}
+
+func TestAdminAuthMiddleware_AcceptsValidToken(t *testing.T) {
+	middleware := AdminAuthMiddleware(
+		testAdminToken,
+		testAdminID,
+	)
+
+	handlerReached := false
+
+	protectedHandler := middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handlerReached = true
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+
+	request := newTestRequest(
+		http.MethodPut,
+		"/v1/admin/waitlist/config",
+	)
+
+	request.Header.Set(
+		"Authorization",
+		"Bearer "+testAdminToken,
+	)
+
+	response := newTestResponse(
+		protectedHandler,
+		request,
+	)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusOK,
+			response.Code,
+		)
+	}
+
+	if !handlerReached {
+		t.Fatal("expected protected handler to be reached")
+	}
+}
+
+func TestAdminAuthMiddleware_InjectsConfiguredAdminID(t *testing.T) {
+	middleware := AdminAuthMiddleware(
+		testAdminToken,
+		testAdminID,
+	)
+
+	protectedHandler := middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			adminID, ok := r.Context().
+				Value(adminIDContextKey{}).(string)
+
+			if !ok {
+				t.Error("expected administrator ID in request context")
+				return
+			}
+
+			if adminID != testAdminID {
+				t.Errorf(
+					"expected administrator ID %q, got %q",
+					testAdminID,
+					adminID,
+				)
+			}
+
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+
+	request := newTestRequest(
+		http.MethodPut,
+		"/v1/admin/waitlist/config",
+	)
+
+	request.Header.Set(
+		"Authorization",
+		"Bearer "+testAdminToken,
+	)
+
+	response := newTestResponse(
+		protectedHandler,
+		request,
+	)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusOK,
+			response.Code,
+		)
+	}
+}
+
+func TestAdminAuthMiddleware_RejectsInvalidConfiguration(t *testing.T) {
+	testCases := []struct {
+		name  string
+		token string
+		id    string
+	}{
+		{
+			name:  "empty token",
+			token: "",
+			id:    testAdminID,
+		},
+		{
+			name:  "short token",
+			token: "short-token",
+			id:    testAdminID,
+		},
+		{
+			name:  "missing administrator ID",
+			token: testAdminToken,
+			id:    "",
+		},
+		{
+			name:  "invalid administrator UUID",
+			token: testAdminToken,
+			id:    "not-a-valid-uuid",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			middleware := AdminAuthMiddleware(
+				testCase.token,
+				testCase.id,
+			)
+
+			protectedHandler := middleware(
+				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					t.Fatal("protected handler should not be reached")
+				}),
+			)
+
+			request := newTestRequest(
+				http.MethodPut,
+				"/v1/admin/waitlist/config",
+			)
+
+			request.Header.Set(
+				"Authorization",
+				"Bearer "+testAdminToken,
+			)
+
+			response := newTestResponse(
+				protectedHandler,
+				request,
+			)
+
+			if response.Code != http.StatusServiceUnavailable {
+				t.Fatalf(
+					"expected status %d, got %d",
+					http.StatusServiceUnavailable,
+					response.Code,
+				)
+			}
+		})
+	}
+}
+
+// =====================================================
+// REGISTRATION RATE LIMITER TESTS
+// =====================================================
+
+func TestRegistrationRateLimiter_AllowsRequestsWithinLimit(t *testing.T) {
+	limiter := NewRegistrationRateLimiter(
+		5,
+		time.Minute,
+	)
+
+	called := 0
+
+	handler := limiter.Middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			called++
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+
+	for i := 0; i < 5; i++ {
+		request := newTestRequest(
+			http.MethodPost,
+			"/v1/waitlist/register",
+		)
+
+		request.RemoteAddr = "192.0.2.10:12345"
+
+		response := newTestResponse(handler, request)
+
+		if response.Code != http.StatusOK {
+			t.Fatalf(
+				"request %d: expected status %d, got %d",
+				i+1,
+				http.StatusOK,
+				response.Code,
+			)
+		}
+	}
+
+	if called != 5 {
+		t.Fatalf(
+			"expected handler to be called 5 times, got %d",
+			called,
+		)
+	}
+}
+
+func TestRegistrationRateLimiter_RejectsRequestsOverLimit(t *testing.T) {
+	limiter := NewRegistrationRateLimiter(
+		5,
+		time.Minute,
+	)
+
+	called := 0
+
+	handler := limiter.Middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			called++
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+
+	var lastResponse *httptest.ResponseRecorder
+
+	for i := 0; i < 6; i++ {
+		request := newTestRequest(
+			http.MethodPost,
+			"/v1/waitlist/register",
+		)
+
+		request.RemoteAddr = "192.0.2.20:12345"
+
+		lastResponse = newTestResponse(handler, request)
+	}
+
+	if lastResponse.Code != http.StatusTooManyRequests {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusTooManyRequests,
+			lastResponse.Code,
+		)
+	}
+
+	if called != 5 {
+		t.Fatalf(
+			"expected handler to be called 5 times, got %d",
+			called,
+		)
+	}
+
+	if lastResponse.Header().Get("Retry-After") == "" {
+		t.Fatal("expected Retry-After header")
+	}
+}
+
+func TestRegistrationRateLimiter_ResetsAfterWindow(t *testing.T) {
+	limiter := NewRegistrationRateLimiter(
+		1,
+		time.Minute,
+	)
+
+	currentTime := time.Date(
+		2026,
+		time.October,
+		30,
+		12,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+
+	limiter.now = func() time.Time {
+		return currentTime
+	}
+
+	handler := limiter.Middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+
+	makeRequest := func() *httptest.ResponseRecorder {
+		request := newTestRequest(
+			http.MethodPost,
+			"/v1/waitlist/register",
+		)
+
+		request.RemoteAddr = "192.0.2.30:12345"
+
+		return newTestResponse(handler, request)
+	}
+
+	first := makeRequest()
+
+	if first.Code != http.StatusOK {
+		t.Fatalf("expected first request to succeed, got %d", first.Code)
+	}
+
+	second := makeRequest()
+
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf(
+			"expected second request to be rate limited, got %d",
+			second.Code,
+		)
+	}
+
+	currentTime = currentTime.Add(time.Minute)
+
+	third := makeRequest()
+
+	if third.Code != http.StatusOK {
+		t.Fatalf(
+			"expected request after window reset to succeed, got %d",
+			third.Code,
+		)
+	}
+}
+
+func TestRegistrationRateLimiter_SeparatesClientIPs(t *testing.T) {
+	limiter := NewRegistrationRateLimiter(
+		1,
+		time.Minute,
+	)
+
+	handler := limiter.Middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+
+	requests := []string{
+		"192.0.2.40:12345",
+		"192.0.2.41:12345",
+	}
+
+	for _, remoteAddr := range requests {
+		request := newTestRequest(
+			http.MethodPost,
+			"/v1/waitlist/register",
+		)
+
+		request.RemoteAddr = remoteAddr
+
+		response := newTestResponse(handler, request)
+
+		if response.Code != http.StatusOK {
+			t.Errorf(
+				"expected independent IP request to succeed, got %d",
+				response.Code,
+			)
+		}
+	}
+}
+
+func TestRegistrationRateLimiter_ConcurrentRequests(t *testing.T) {
+	const (
+		limit       = 5
+		concurrency = 20
+	)
+
+	limiter := NewRegistrationRateLimiter(
+		limit,
+		time.Minute,
+	)
+
+	var successful int
+	var rateLimited int
+
+	var resultMu sync.Mutex
+	var waitGroup sync.WaitGroup
+
+	handler := limiter.Middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+
+	for i := 0; i < concurrency; i++ {
+		waitGroup.Add(1)
+
+		go func() {
+			defer waitGroup.Done()
+
+			request := newTestRequest(
+				http.MethodPost,
+				"/v1/waitlist/register",
+			)
+
+			request.RemoteAddr = "192.0.2.50:12345"
+
+			response := newTestResponse(handler, request)
+
+			resultMu.Lock()
+			defer resultMu.Unlock()
+
+			switch response.Code {
+			case http.StatusOK:
+				successful++
+
+			case http.StatusTooManyRequests:
+				rateLimited++
+
+			default:
+				t.Errorf(
+					"unexpected response status: %d",
+					response.Code,
+				)
+			}
+		}()
+	}
+
+	waitGroup.Wait()
+
+	if successful != limit {
+		t.Errorf(
+			"expected %d successful requests, got %d",
+			limit,
+			successful,
+		)
+	}
+
+	if rateLimited != concurrency-limit {
+		t.Errorf(
+			"expected %d rate-limited requests, got %d",
+			concurrency-limit,
+			rateLimited,
+		)
+	}
+}
+
+// =====================================================
+// CORS TESTS
+// =====================================================
+
+func TestCORSMiddleware_AllowsConfiguredOrigin(t *testing.T) {
+	middleware := CORSMiddleware(
+		[]string{
+			"https://lumayapower.co.uk",
+			"https://www.lumayapower.co.uk",
+		},
+	)
+
+	handler := middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+
+	request := newTestRequest(
+		http.MethodGet,
+		"/v1/waitlist/count",
+	)
+
+	request.Header.Set(
+		"Origin",
+		"https://lumayapower.co.uk",
+	)
+
+	response := newTestResponse(handler, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusOK,
+			response.Code,
+		)
+	}
+
+	if got := response.Header().Get("Access-Control-Allow-Origin"); got != "https://lumayapower.co.uk" {
+		t.Errorf(
+			"unexpected allowed origin: %q",
+			got,
+		)
+	}
+
+	if got := response.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+		t.Errorf(
+			"credentials must not be enabled, got %q",
+			got,
+		)
+	}
+}
+
+func TestCORSMiddleware_RejectsUnconfiguredOrigin(t *testing.T) {
+	middleware := CORSMiddleware(
+		[]string{
+			"https://lumayapower.co.uk",
+		},
+	)
+
+	handler := middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Fatal("handler should not be reached")
+		}),
+	)
+
+	request := newTestRequest(
+		http.MethodGet,
+		"/v1/waitlist/count",
+	)
+
+	request.Header.Set(
+		"Origin",
+		"https://malicious.example",
+	)
+
+	response := newTestResponse(handler, request)
+
+	if response.Code != http.StatusForbidden {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusForbidden,
+			response.Code,
+		)
+	}
+}
+
+func TestCORSMiddleware_AllowsRequestWithoutOrigin(t *testing.T) {
+	middleware := CORSMiddleware(
+		[]string{
+			"https://lumayapower.co.uk",
+		},
+	)
+
+	handler := middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+
+	request := newTestRequest(
+		http.MethodGet,
+		"/v1/waitlist/count",
+	)
+
+	response := newTestResponse(handler, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusOK,
+			response.Code,
+		)
+	}
+}
+
+func TestCORSMiddleware_AllowsValidPreflight(t *testing.T) {
+	middleware := CORSMiddleware(
+		[]string{
+			"https://lumayapower.co.uk",
+		},
+	)
+
+	handler := middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Fatal("preflight request should not reach application handler")
+		}),
+	)
+
+	request := newTestRequest(
+		http.MethodOptions,
+		"/v1/waitlist/register",
+	)
+
+	request.Header.Set(
+		"Origin",
+		"https://lumayapower.co.uk",
+	)
+
+	request.Header.Set(
+		"Access-Control-Request-Method",
+		"POST",
+	)
+
+	request.Header.Set(
+		"Access-Control-Request-Headers",
+		"content-type, authorization",
+	)
+
+	response := newTestResponse(handler, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusNoContent,
+			response.Code,
+		)
+	}
+
+	if response.Header().Get("Access-Control-Allow-Origin") != "https://lumayapower.co.uk" {
+		t.Fatal("expected configured origin in preflight response")
+	}
+}
+
+func TestCORSMiddleware_RejectsDisallowedPreflightMethod(t *testing.T) {
+	middleware := CORSMiddleware(
+		[]string{
+			"https://lumayapower.co.uk",
+		},
+	)
+
+	handler := middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Fatal("preflight request should not reach application handler")
+		}),
+	)
+
+	request := newTestRequest(
+		http.MethodOptions,
+		"/v1/waitlist/register",
+	)
+
+	request.Header.Set(
+		"Origin",
+		"https://lumayapower.co.uk",
+	)
+
+	request.Header.Set(
+		"Access-Control-Request-Method",
+		"DELETE",
+	)
+
+	response := newTestResponse(handler, request)
+
+	if response.Code != http.StatusForbidden {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusForbidden,
+			response.Code,
+		)
+	}
+}
+
+func TestCORSMiddleware_RejectsDisallowedPreflightHeader(t *testing.T) {
+	middleware := CORSMiddleware(
+		[]string{
+			"https://lumayapower.co.uk",
+		},
+	)
+
+	handler := middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Fatal("preflight request should not reach application handler")
+		}),
+	)
+
+	request := newTestRequest(
+		http.MethodOptions,
+		"/v1/waitlist/register",
+	)
+
+	request.Header.Set(
+		"Origin",
+		"https://lumayapower.co.uk",
+	)
+
+	request.Header.Set(
+		"Access-Control-Request-Method",
+		"POST",
+	)
+
+	request.Header.Set(
+		"Access-Control-Request-Headers",
+		"content-type, x-unauthorised-header",
+	)
+
+	response := newTestResponse(handler, request)
+
+	if response.Code != http.StatusForbidden {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusForbidden,
+			response.Code,
+		)
+	}
+}
+
+func TestCORSMiddleware_DoesNotAllowWildcardOrigin(t *testing.T) {
+	middleware := CORSMiddleware(
+		[]string{"*"},
+	)
+
+	handler := middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+
+	request := newTestRequest(
+		http.MethodGet,
+		"/v1/waitlist/count",
+	)
+
+	request.Header.Set(
+		"Origin",
+		"https://lumayapower.co.uk",
+	)
+
+	response := newTestResponse(handler, request)
+
+	if response.Code != http.StatusForbidden {
+		t.Fatalf(
+			"expected wildcard origin to be rejected, got %d",
+			response.Code,
+		)
+	}
+}
+
+func TestCORSMiddleware_PreservesExistingVaryHeaders(t *testing.T) {
+	middleware := CORSMiddleware(
+		[]string{"https://lumayapower.co.uk"},
+	)
+
+	handler := middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Add("Vary", "Accept-Encoding")
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+
+	request := newTestRequest(
+		http.MethodGet,
+		"/v1/waitlist/count",
+	)
+
+	request.Header.Set(
+		"Origin",
+		"https://lumayapower.co.uk",
+	)
+
+	response := newTestResponse(handler, request)
+
+	vary := strings.Join(
+		response.Header().Values("Vary"),
+		",",
+	)
+
+	if !strings.Contains(vary, "Origin") {
+		t.Errorf("expected Vary to contain Origin, got %q", vary)
+	}
+
+	if !strings.Contains(vary, "Accept-Encoding") {
+		t.Errorf("expected existing Vary header to be preserved, got %q", vary)
+	}
+}
+
+// =====================================================
+// ROUTE SECURITY TESTS
+// =====================================================
+
+func TestRegisterRoutes_ProtectsAdminConfiguration(t *testing.T) {
+	router := chi.NewRouter()
+
+	// The handler's service is deliberately nil because
+	// the request must be rejected before reaching it.
+	handler := &Handler{}
+
+	RegisterRoutes(
+		router,
+		handler,
+		RouteConfig{
+			AdminToken: testAdminToken,
+			AdminID:    testAdminID,
+		},
+	)
+
+	request := newTestRequest(
+		http.MethodPut,
+		"/v1/admin/waitlist/config",
+	)
+
+	response := newTestResponse(router, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusUnauthorized,
+			response.Code,
+		)
+	}
+}
+
+func TestRegisterRoutes_RejectsInvalidAdminToken(t *testing.T) {
+	router := chi.NewRouter()
+
+	handler := &Handler{}
+
+	RegisterRoutes(
+		router,
+		handler,
+		RouteConfig{
+			AdminToken: testAdminToken,
+			AdminID:    testAdminID,
+		},
+	)
+
+	request := newTestRequest(
+		http.MethodPut,
+		"/v1/admin/waitlist/config",
+	)
+
+	request.Header.Set(
+		"Authorization",
+		"Bearer incorrect-token",
+	)
+
+	response := newTestResponse(router, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusUnauthorized,
+			response.Code,
+		)
+	}
+}
+
+func TestRegisterRoutes_RejectsUnconfiguredAdminIdentity(t *testing.T) {
+	router := chi.NewRouter()
+
+	handler := &Handler{}
+
+	RegisterRoutes(
+		router,
+		handler,
+		RouteConfig{
+			AdminToken: testAdminToken,
+			AdminID:    "invalid-uuid",
+		},
+	)
+
+	request := newTestRequest(
+		http.MethodPut,
+		"/v1/admin/waitlist/config",
+	)
+
+	request.Header.Set(
+		"Authorization",
+		"Bearer "+testAdminToken,
+	)
+
+	response := newTestResponse(router, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusServiceUnavailable,
+			response.Code,
+		)
+	}
+}
+
+// =====================================================
+// CONTEXT ISOLATION TEST
+// =====================================================
+
+func TestAdminAuthMiddleware_DoesNotTrustClientSuppliedAdminID(t *testing.T) {
+	middleware := AdminAuthMiddleware(
+		testAdminToken,
+		testAdminID,
+	)
+
+	protectedHandler := middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			adminID, ok := r.Context().
+				Value(adminIDContextKey{}).(string)
+
+			if !ok || adminID != testAdminID {
+				t.Errorf(
+					"expected configured admin identity %q, got %q",
+					testAdminID,
+					adminID,
+				)
+			}
+
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+
+	request := newTestRequest(
+		http.MethodPut,
+		"/v1/admin/waitlist/config",
+	)
+
+	request.Header.Set(
+		"Authorization",
+		"Bearer "+testAdminToken,
+	)
+
+	// A client must not be able to choose the audit identity.
+	request.Header.Set(
+		"X-Admin-ID",
+		"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+	)
+
+	request = request.WithContext(
+		context.Background(),
+	)
+
+	response := newTestResponse(
+		protectedHandler,
+		request,
+	)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusOK,
+			response.Code,
+		)
+	}
+}
+
+========================================
+FILE: internal/app/server.go
+========================================
+package app
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/middleware"
+	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/lumaya-wishlist-backend/internal/waitlist"
+)
+
+type DBPinger interface {
+	Ping(ctx context.Context) error
+}
+
+type Server struct {
+	handler http.Handler
+	db      DBPinger
+}
+
+// NewServer initialises the HTTP application.
+//
+// It does not create databases, modify database permissions,
+// or run database migrations. The supplied PostgreSQL pool
+// must already be connected to the dedicated waitlist database.
+func NewServer(pool *pgxpool.Pool) (*Server, error) {
+	if pool == nil {
+		return nil, errors.New("database connection pool is required")
+	}
+
+	// --------------------------------------------------
+	// 1. Validate administrator configuration
+	// --------------------------------------------------
+
+	adminToken := strings.TrimSpace(
+		os.Getenv("ADMIN_API_TOKEN"),
+	)
+
+	if len(adminToken) < 32 {
+		return nil, errors.New(
+			"ADMIN_API_TOKEN must contain at least 32 characters",
+		)
+	}
+
+	adminID := strings.TrimSpace(
+		os.Getenv("ADMIN_ID"),
+	)
+
+	if !validUUID(adminID) {
+		return nil, errors.New(
+			"ADMIN_ID must be a valid UUID",
+		)
+	}
+
+	// --------------------------------------------------
+	// 2. Initialise unsubscribe token manager
+	// --------------------------------------------------
+
+	unsubscribeSecret := os.Getenv(
+		"UNSUBSCRIBE_TOKEN_SECRET",
+	)
+
+	tokenManager, err := waitlist.NewUnsubscribeTokenManager(
+		unsubscribeSecret,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// --------------------------------------------------
+	// 3. Load CORS configuration
+	// --------------------------------------------------
+
+	origins := parseAllowedOrigins(
+		os.Getenv("CORS_ALLOWED_ORIGINS"),
+	)
+
+	// --------------------------------------------------
+	// 4. Initialise application dependencies
+	// --------------------------------------------------
+
+	repository := waitlist.NewPostgresRepository(pool)
+
+	service := waitlist.NewService(repository)
+
+	handler := waitlist.NewHandler(
+		service,
+		tokenManager,
+	)
+
+	// --------------------------------------------------
+	// 5. Initialise HTTP router
+	// --------------------------------------------------
+
+	router := chi.NewRouter()
+
+	// Request identification and panic recovery.
+	router.Use(middleware.RequestID)
+	router.Use(middleware.Recoverer)
+
+	// Security headers.
+	router.Use(securityHeaders)
+
+	// Exact-origin CORS allowlist.
+	router.Use(
+		waitlist.CORSMiddleware(origins),
+	)
+
+	// --------------------------------------------------
+	// 6. Health check endpoints
+	// --------------------------------------------------
+
+	server := &Server{
+		handler: router,
+		db:      pool,
+	}
+
+	router.Get(
+		"/health/live",
+		server.liveHandler,
+	)
+
+	router.Get(
+		"/health/ready",
+		server.readyHandler,
+	)
+
+	// --------------------------------------------------
+	// 7. Register waitlist endpoints
+	// --------------------------------------------------
+
+	waitlist.RegisterRoutes(
+		router,
+		handler,
+		waitlist.RouteConfig{
+			AdminToken:     adminToken,
+			AdminID:        adminID,
+			AllowedOrigins: origins,
+		},
+	)
+
+	return server, nil
+}
+
+// Handler exposes the configured HTTP handler.
+func (s *Server) Handler() http.Handler {
+	return s.handler
+}
+
+// --------------------------------------------------
+// Health checks
+// --------------------------------------------------
+
+// liveHandler confirms that the application process
+// is running. It does not check database availability.
+func (s *Server) liveHandler(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	writeJSON(
+		w,
+		http.StatusOK,
+		map[string]interface{}{
+			"success": true,
+			"status":  "alive",
+		},
+	)
+}
+
+// readyHandler confirms that the application can
+// communicate with its PostgreSQL database.
+func (s *Server) readyHandler(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	ctx, cancel := context.WithTimeout(
+		r.Context(),
+		3*time.Second,
+	)
+	defer cancel()
+
+	if s.db == nil {
+		writeJSON(
+			w,
+			http.StatusServiceUnavailable,
+			map[string]interface{}{
+				"success": false,
+				"status":  "not_ready",
+			},
+		)
+		return
+	}
+
+	if err := s.db.Ping(ctx); err != nil {
+		// Do not expose database errors or connection details.
+		writeJSON(
+			w,
+			http.StatusServiceUnavailable,
+			map[string]interface{}{
+				"success": false,
+				"status":  "not_ready",
+			},
+		)
+		return
+	}
+
+	writeJSON(
+		w,
+		http.StatusOK,
+		map[string]interface{}{
+			"success":  true,
+			"status":   "ready",
+			"database": "connected",
+		},
+	)
+}
+
+// --------------------------------------------------
+// Shared HTTP helpers
+// --------------------------------------------------
+
+func writeJSON(
+	w http.ResponseWriter,
+	status int,
+	payload interface{},
+) {
+	w.Header().Set(
+		"Content-Type",
+		"application/json",
+	)
+
+	w.WriteHeader(status)
+
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// --------------------------------------------------
+// Security middleware
+// --------------------------------------------------
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set(
+				"X-Content-Type-Options",
+				"nosniff",
+			)
+
+			w.Header().Set(
+				"X-Frame-Options",
+				"DENY",
+			)
+
+			w.Header().Set(
+				"Referrer-Policy",
+				"no-referrer",
+			)
+
+			w.Header().Set(
+				"Cache-Control",
+				"no-store",
+			)
+
+			next.ServeHTTP(w, r)
+		},
+	)
+}
+
+// --------------------------------------------------
+// CORS configuration
+// --------------------------------------------------
+
+// parseAllowedOrigins converts the comma-separated
+// environment variable into a clean origin allowlist.
+func parseAllowedOrigins(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+
+	rawOrigins := strings.Split(value, ",")
+
+	origins := make([]string, 0, len(rawOrigins))
+
+	for _, origin := range rawOrigins {
+		origin = strings.TrimSpace(origin)
+
+		if origin == "" {
+			continue
+		}
+
+		origins = append(origins, origin)
+	}
+
+	return origins
+}
+
+// --------------------------------------------------
+// UUID validation
+// --------------------------------------------------
+
+func validUUID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+
+	for i, character := range value {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if character != '-' {
+				return false
+			}
+			continue
+		}
+
+		isDigit := character >= '0' && character <= '9'
+		isLowerHex := character >= 'a' && character <= 'f'
+		isUpperHex := character >= 'A' && character <= 'F'
+
+		if !isDigit && !isLowerHex && !isUpperHex {
+			return false
+		}
+	}
+
+	return true
+}
+
+// --------------------------------------------------
+// Application logger
+// --------------------------------------------------
+
+// Keep structured application logging available.
+//
+// Never log:
+// - Resident email addresses
+// - Unsubscribe tokens
+// - Authorization headers
+// - Request bodies
+// - Sensitive registration information
+func applicationLogger() *slog.Logger {
+	return slog.New(
+		slog.NewJSONHandler(
+			os.Stdout,
+			nil,
+		),
+	)
+}
+
+========================================
+FILE: migrations/00001_create_waitlist_tables.sql
+========================================
+-- +goose Up
+
+CREATE SCHEMA IF NOT EXISTS waitlist;
+
+CREATE TABLE waitlist.waitlist_registration (
+    registration_id UUID PRIMARY KEY,
+    email VARCHAR(254) NOT NULL,
+    position BIGINT NOT NULL,
+
+    launch_updates_consent BOOLEAN NOT NULL DEFAULT FALSE,
+    marketing_consent BOOLEAN NOT NULL DEFAULT FALSE,
+
+    consent_recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    launch_updates_unsubscribed_at TIMESTAMPTZ,
+    marketing_unsubscribed_at TIMESTAMPTZ,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_waitlist_email UNIQUE (email),
+    CONSTRAINT uq_waitlist_position UNIQUE (position),
+
+    CONSTRAINT chk_waitlist_position CHECK (position > 0),
+
+    CONSTRAINT chk_waitlist_email
+        CHECK (email = LOWER(BTRIM(email)) AND LENGTH(email) > 0)
+);
+
+CREATE TABLE waitlist.waitlist_counter (
+    counter_id SMALLINT PRIMARY KEY CHECK (counter_id = 1),
+    last_position BIGINT NOT NULL DEFAULT 0
+        CHECK (last_position >= 0)
+);
+
+INSERT INTO waitlist.waitlist_counter (counter_id, last_position)
+VALUES (1, 0);
+
+CREATE TABLE waitlist.waitlist_config (
+    config_id UUID PRIMARY KEY,
+    config_key VARCHAR(30) NOT NULL UNIQUE DEFAULT 'default',
+    launch_at TIMESTAMPTZ NOT NULL,
+    timezone VARCHAR(100) NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_by UUID,
+
+    CONSTRAINT chk_waitlist_config_key
+        CHECK (config_key = 'default'),
+
+    CONSTRAINT chk_waitlist_timezone
+        CHECK (LENGTH(BTRIM(timezone)) > 0)
+);
+
+CREATE INDEX idx_waitlist_registration_created
+    ON waitlist.waitlist_registration (created_at DESC);
+
+-- +goose Down
+
+DROP SCHEMA IF EXISTS waitlist CASCADE;
+
+========================================
+FILE: migrations/00002_waitlist_security_audit.sql
+========================================
+
+-- +goose Up
+
+CREATE TABLE waitlist.waitlist_admin_audit (
+    audit_id UUID PRIMARY KEY,
+
+    admin_id VARCHAR(100) NOT NULL,
+
+    action VARCHAR(50) NOT NULL,
+
+    previous_launch_at TIMESTAMPTZ,
+    new_launch_at TIMESTAMPTZ,
+
+    previous_timezone VARCHAR(100),
+    new_timezone VARCHAR(100),
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT chk_waitlist_admin_audit_action
+        CHECK (action = 'UPDATE_LAUNCH_CONFIG')
+);
+
+CREATE INDEX idx_waitlist_admin_audit_created_at
+    ON waitlist.waitlist_admin_audit (created_at DESC);
+
+
+-- +goose Down
+
+DROP TABLE IF EXISTS waitlist.waitlist_admin_audit;
+
+========================================
+FILE: go.mod
+========================================
+module github.com/lumaya-wishlist-backend
+
+go 1.26.0
+
+require (
+	github.com/go-chi/chi/v5 v5.5.0
+	github.com/jackc/pgx/v5 v5.11.0
+	github.com/joho/godotenv v1.5.1
+)
+
+require (
+	filippo.io/edwards25519 v1.2.0 // indirect
+	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.3 // indirect
+	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.1 // indirect
+	github.com/Azure/azure-sdk-for-go/sdk/internal v1.13.0 // indirect
+	github.com/AzureAD/microsoft-authentication-library-for-go v1.10.1 // indirect
+	github.com/ClickHouse/ch-go v0.74.0 // indirect
+	github.com/ClickHouse/clickhouse-go/v2 v2.49.0 // indirect
+	github.com/andybalholm/brotli v1.2.6 // indirect
+	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/coder/websocket v1.8.15 // indirect
+	github.com/dustin/go-humanize v1.1.0 // indirect
+	github.com/elastic/go-sysinfo v1.15.5 // indirect
+	github.com/elastic/go-windows v1.0.2 // indirect
+	github.com/go-chi/chi v1.5.5
+	github.com/go-faster/city v1.0.1 // indirect
+	github.com/go-faster/errors v0.8.0 // indirect
+	github.com/go-sql-driver/mysql v1.10.1 // indirect
+	github.com/golang-jwt/jwt/v4 v4.5.2 // indirect
+	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
+	github.com/golang-sql/civil v0.0.0-20220223132316-b832511892a9 // indirect
+	github.com/golang-sql/sqlexp v0.1.0 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.3 // indirect
+	github.com/jonboulle/clockwork v0.5.0 // indirect
+	github.com/klauspost/compress v1.20.1 // indirect
+	github.com/kylelemons/godebug v1.1.0 // indirect
+	github.com/mattn/go-isatty v0.0.24 // indirect
+	github.com/mfridman/interpolate v0.0.2 // indirect
+	github.com/mfridman/xflag v0.1.0 // indirect
+	github.com/microsoft/go-mssqldb v1.11.2 // indirect
+	github.com/ncruces/go-strftime v1.1.0 // indirect
+	github.com/paulmach/orb v0.13.0 // indirect
+	github.com/pierrec/lz4/v4 v4.1.33 // indirect
+	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
+	github.com/pressly/goose/v3 v3.29.0 // indirect
+	github.com/prometheus/procfs v0.22.0 // indirect
+	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/segmentio/asm v1.2.1 // indirect
+	github.com/sethvargo/go-retry v0.5.0 // indirect
+	github.com/shopspring/decimal v1.5.0 // indirect
+	github.com/stretchr/testify v1.12.1 // indirect
+	github.com/tursodatabase/libsql-client-go v0.0.0-20260528064733-9d5d30a29a60 // indirect
+	github.com/vertica/vertica-sql-go v1.3.8 // indirect
+	github.com/yandex-cloud/go-genproto v0.126.0 // indirect
+	github.com/ydb-platform/ydb-go-genproto v0.0.0-20260810123728-f0c151ab31b9 // indirect
+	github.com/ydb-platform/ydb-go-sdk-auth-environ v0.5.3 // indirect
+	github.com/ydb-platform/ydb-go-sdk/v3 v3.155.1 // indirect
+	github.com/ydb-platform/ydb-go-yc v0.12.5 // indirect
+	github.com/ydb-platform/ydb-go-yc-metadata v0.6.2 // indirect
+	github.com/ziutek/mymysql v1.5.4 // indirect
+	go.opentelemetry.io/otel v1.47.0 // indirect
+	go.opentelemetry.io/otel/trace v1.47.0 // indirect
+	go.uber.org/multierr v1.11.0 // indirect
+	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/exp v0.0.0-20261011100332-faecfb24eb49 // indirect
+	golang.org/x/net v0.61.0 // indirect
+	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20261005182115-fad411399dd8 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20261005182115-fad411399dd8 // indirect
+	google.golang.org/grpc v1.84.0 // indirect
+	google.golang.org/protobuf v1.36.12 // indirect
+	howett.net/plist v1.0.1 // indirect
+	modernc.org/libc v1.78.0 // indirect
+	modernc.org/mathutil v1.7.1 // indirect
+	modernc.org/memory v1.12.1 // indirect
+	modernc.org/sqlite v1.60.1 // indirect
+)
