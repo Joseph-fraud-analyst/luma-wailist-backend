@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -195,21 +196,25 @@ func (h *Handler) Register(
 			"This email is already registered."
 	}
 
-	// Send the welcome email only for a genuinely
-	// new registration. A duplicate registration
-	// must not trigger another welcome email.
+	// Send the welcome email only for a genuinely new
+	// registration. A duplicate registration must not
+	// trigger another welcome email.
 	//
 	// Email delivery failure does not undo a successful
 	// database registration.
-	if !result.IsExisting &&
-		h.emailSender != nil {
-
-		_ = h.emailSender.SendWelcomeEmail(
+	if !result.IsExisting && h.emailSender != nil {
+		if err := h.emailSender.SendWelcomeEmail(
 			r.Context(),
 			result.Registration.Email,
-		)
+		); err != nil {
+			// Never log the resident's email address.
+			// Registration remains successful even if email delivery fails.
+			slog.Error(
+				"Failed to send waitlist welcome email",
+				"error", err,
+			)
+		}
 	}
-
 	writeJSON(
 		w,
 		status,

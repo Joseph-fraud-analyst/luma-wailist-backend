@@ -88,11 +88,23 @@ func NewServer(
 		os.Getenv("SENDGRID_API_KEY"),
 	)
 
-	emailSender, err :=
-		waitlist.NewSendGridEmailSender(
-			sendGridAPIKey,
-			"lumayapower@gmail.com",
-		)
+	sendGridSenderEmail := strings.TrimSpace(
+		os.Getenv("SENDGRID_SENDER_EMAIL"),
+	)
+
+	slog.Info(
+		"SendGrid configuration loaded",
+		"api_key_present", sendGridAPIKey != "",
+		"api_key_length", len(sendGridAPIKey),
+		"sender_email_present", sendGridSenderEmail != "",
+		"api_key_prefix", firstCharacters(sendGridAPIKey, 3),
+		"sender_email", sendGridSenderEmail,
+	)
+
+	emailSender, err := waitlist.NewSendGridEmailSender(
+		sendGridAPIKey,
+		sendGridSenderEmail,
+	)
 
 	if err != nil {
 		return nil, err
@@ -187,6 +199,14 @@ func NewServer(
 	)
 
 	return server, nil
+}
+
+func firstCharacters(value string, length int) string {
+	if len(value) <= length {
+		return value
+	}
+
+	return value[:length]
 }
 
 // Handler exposes the configured HTTP handler.
